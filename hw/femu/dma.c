@@ -23,7 +23,7 @@ void nvme_addr_write(FemuCtrl *n, hwaddr addr, void *buf, int size)
 uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
                       uint64_t prp2, uint32_t len, FemuCtrl *n)
 {
-    hwaddr trans_len = n->page_size - (prp1 % n->page_size);
+    hwaddr trans_len = n->page_size - (prp1 % n->page_size); // 从起始地址 prp1 开始，一直到当前内存页结束，这一段连续空间的最大长度
     trans_len = MIN(len, trans_len);
     int num_prps = (len >> n->page_bits) + 1;
     bool cmb = false;

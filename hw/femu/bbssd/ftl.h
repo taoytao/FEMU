@@ -156,13 +156,19 @@ struct ssdparams {
     int tt_luns;      /* total # of LUNs in the SSD */
 };
 
+/* LPN access tracking for hot/cold data identification */
+struct lba_access {
+    uint64_t last_write_time;  /* Last write time in nanoseconds */
+    uint32_t write_count;      /* Write count in the time window */
+    uint32_t reserved;         /* Reserved for future use */
+};
+
 typedef struct line {
     int id;  /* line id, the same as corresponding block id */
     int ipc; /* invalid page count in this line */
     int vpc; /* valid page count in this line */
+    int type; /* 0: cold, 1: hot */
     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
-    /* position in the priority queue for victim lines */
-    size_t                  pos;
 } line;
 
 /* wp: record next write addr */
@@ -182,6 +188,13 @@ struct line_mgmt {
     pqueue_t *victim_line_pq;
     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
     QTAILQ_HEAD(full_line_list, line) full_line_list;
+    
+    /* Hot and cold data victim lists indexed by invalid page count */
+    QTAILQ_HEAD(, line) *hot_victim_lists;  /* Hot data victim lists */
+    QTAILQ_HEAD(, line) *cold_victim_lists; /* Cold data victim lists */
+    int hot_victim_list_size;               /* Size of hot victim lists */
+    int cold_victim_list_size;              /* Size of cold victim lists */
+    
     int tt_lines;
     int free_line_cnt;
     int victim_line_cnt;
@@ -202,6 +215,12 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+
+    /* LPN access tracking for hot/cold data identification */
+    struct lba_access *lba_access_table;  /* LPN access tracking table */
+    uint64_t current_time;                /* Current time in nanoseconds */
+    struct line *hot_curline;             /* Current hot data write line */
+    struct line *cold_curline;            /* Current cold data write line */
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

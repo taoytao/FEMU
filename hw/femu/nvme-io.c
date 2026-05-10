@@ -267,7 +267,9 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     int ret;
 
     req->is_write = (rw->opcode == NVME_CMD_WRITE) ? 1 : 0;
-
+    
+    printf("NVMe Read: NSID=%u, SLBA=%lu, NLB=%u\n", cmd->nsid, slba, nlb);
+    
     err = femu_nvme_rw_check_req(n, ns, cmd, req, slba, elba, nlb, ctrl,
                                  data_size, meta_size);
     if (err)
@@ -292,6 +294,36 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 
     return NVME_DNR;
 }
+
+// uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
+// {
+//     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+//     // --- 步骤 1: 提取 SLBA (起始 LBA) ---
+//     // rw->slba是一个联合体成员，对应 CDW10 和 CDW11
+//     uint64_t slba = le64_to_cpu(rw->slba);  // 起始64位逻辑地址
+
+//     // --- 步骤 2: 提取 NLB (扇区数量) ---
+//     // rw->nlb 对应 CDW12 的低 16 位
+//     // +1 是因为 NLB 是 0-based
+//     uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;     // 访问的扇区数量
+
+//     // --- 步骤 3: 边界检查 (非常重要) ---
+//     // ns->id_ns.nsze 是该命名空间的总扇区数
+//     if ((slba + nlb) > ns->id_ns.nsze) {
+//         printf("Error: LBA out of range (SLBA: %lu, NLB: %u, NSZE: %lu)\n", 
+//                slba, nlb, ns->id_ns.nsze);
+//         return NVME_LBA_RANGE | NVME_DNR; // 返回 LBA 范围错误
+//     }
+
+//     // --- 步骤  命令解析完成，打印日志 (用于 GDB/Console 验证) ---
+//     // 这里的 printf 会输出到 QEMU 的控制台
+//     printf("NVMe Read: NSID=%u, SLBA=%lu, NLB=%u\n", cmd->nsid, slba, nlb);
+
+//     // TODO: Day 2 任务 - DMA 映射与数据搬运
+//     // ...
+
+//     return NVME_SUCCESS;
+// }
 
 static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                          NvmeRequest *req)

@@ -56,31 +56,6 @@ static inline void set_rmap_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
     ssd->rmap[pgidx] = lpn;
 }
 
-static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
-{
-    return (next > curr);
-}
-
-static inline pqueue_pri_t victim_line_get_pri(void *a)
-{
-    return ((struct line *)a)->vpc;
-}
-
-static inline void victim_line_set_pri(void *a, pqueue_pri_t pri)
-{
-    ((struct line *)a)->vpc = pri;
-}
-
-static inline size_t victim_line_get_pos(void *a)
-{
-    return ((struct line *)a)->pos;
-}
-
-static inline void victim_line_set_pos(void *a, size_t pos)
-{
-    ((struct line *)a)->pos = pos;
-}
-
 static void ssd_init_lines(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -92,10 +67,21 @@ static void ssd_init_lines(struct ssd *ssd)
     lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
 
     QTAILQ_INIT(&lm->free_line_list);
-    lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
-            victim_line_get_pri, victim_line_set_pri,
-            victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&lm->full_line_list);
+
+    /* Initialize cold data victim lists indexed by invalid page count */
+    lm->cold_victim_list_size = spp->pgs_per_line + 1;
+    lm->cold_victim_lists = g_malloc0(sizeof(QTAILQ_HEAD(, line)) * lm->cold_victim_list_size);
+    for (int i = 0; i < lm->cold_victim_list_size; i++) {
+        QTAILQ_INIT(&lm->cold_victim_lists[i]);
+    }
+
+    /* Initialize hot data victim lists indexed by invalid page count */
+    lm->hot_victim_list_size = spp->pgs_per_line + 1;
+    lm->hot_victim_lists = g_malloc0(sizeof(QTAILQ_HEAD(, line)) * lm->hot_victim_list_size);
+    for (int i = 0; i < lm->hot_victim_list_size; i++) {
+        QTAILQ_INIT(&lm->hot_victim_lists[i]);
+    }
 
     lm->free_line_cnt = 0;
     for (int i = 0; i < lm->tt_lines; i++) {
@@ -103,7 +89,7 @@ static void ssd_init_lines(struct ssd *ssd)
         line->id = i;
         line->ipc = 0;
         line->vpc = 0;
-        line->pos = 0;
+        line->type = 0; /* Initialize as cold */
         /* initialize all the lines as free lines */
         QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
         lm->free_line_cnt++;
@@ -120,12 +106,22 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
 
+    /* Initialize hot data write pointer */
     curline = QTAILQ_FIRST(&lm->free_line_list);
     QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
     lm->free_line_cnt--;
+    ssd->hot_curline = curline;
+    ssd->hot_curline->type = 1; /* Mark as hot data line */
+
+    /* Initialize cold data write pointer */
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    lm->free_line_cnt--;
+    ssd->cold_curline = curline;
+    ssd->cold_curline->type = 0; /* Mark as cold data line */
 
     /* wpp->curline is always our next-to-write super-block */
-    wpp->curline = curline;
+    wpp->curline = ssd->cold_curline; /* Default to cold data line */
     wpp->ch = 0;
     wpp->lun = 0;
     wpp->pg = 0;
@@ -159,6 +155,17 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
     struct ssdparams *spp = &ssd->sp;
     struct write_pointer *wpp = &ssd->wp;
     struct line_mgmt *lm = &ssd->lm;
+    struct line **curline_ptr;
+    int line_type;
+
+    /* Determine which current line pointer we're using */
+    if (wpp->curline == ssd->hot_curline) {
+        curline_ptr = &ssd->hot_curline;
+        line_type = 1;
+    } else {
+        curline_ptr = &ssd->cold_curline;
+        line_type = 0;
+    }
 
     check_addr(wpp->ch, spp->nchs);
     wpp->ch++;
@@ -184,7 +191,12 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
                     ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
                     /* there must be some invalid pages in this line */
                     ftl_assert(wpp->curline->ipc > 0);
-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
+                    /* Add to appropriate victim list based on line type */
+                    if (line_type == 1) {
+                        QTAILQ_INSERT_TAIL(&lm->hot_victim_lists[wpp->curline->ipc], wpp->curline, entry);
+                    } else {
+                        QTAILQ_INSERT_TAIL(&lm->cold_victim_lists[wpp->curline->ipc], wpp->curline, entry);
+                    }
                     lm->victim_line_cnt++;
                 }
                 /* current line is used up, pick another empty line */
@@ -195,6 +207,8 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
                     /* TODO */
                     abort();
                 }
+                wpp->curline->type = line_type; /* Set line type */
+                *curline_ptr = wpp->curline; /* Update current line pointer */
                 wpp->blk = wpp->curline->id;
                 check_addr(wpp->blk, spp->blks_per_pl);
                 /* make sure we are starting from page 0 in the super block */
@@ -276,14 +290,53 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
 
-    spp->gc_thres_pcent = n->bb_params.gc_thres_pcent/100.0;
-    spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = n->bb_params.gc_thres_pcent_high/100.0;
-    spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
+    /* GC trigger threshold: 20% free blocks remaining */
+    spp->gc_thres_pcent = 0.8;
+    spp->gc_thres_lines = (int)(spp->gc_thres_pcent * spp->tt_lines);
+    /* High priority GC threshold: 5% free blocks remaining */
+    spp->gc_thres_pcent_high = 0.95;
+    spp->gc_thres_lines_high = (int)(spp->gc_thres_pcent_high * spp->tt_lines);
     spp->enable_gc_delay = true;
 
 
     check_params(spp);
+}
+
+/* Initialize LBA access tracking table */
+static void ssd_init_lba_access_tracking(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+    ssd->lba_access_table = g_malloc0(sizeof(struct lba_access) * spp->tt_pgs);
+    ssd->current_time = 0;
+}
+
+/* Check if LPN is hot data */
+static bool is_hot_data(struct ssd *ssd, uint64_t lpn)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct lba_access *access = &ssd->lba_access_table[lpn];
+    uint64_t time_diff = ssd->current_time - access->last_write_time;
+    
+    /* If LPN was written more than 20 times in the last minute (60 seconds) */
+    if (time_diff < 60000000000ULL && access->write_count >= 20) {
+        return true;
+    }
+    return false;
+}
+
+/* Update LBA access information */
+static void update_lba_access(struct ssd *ssd, uint64_t lpn)
+{
+    struct lba_access *access = &ssd->lba_access_table[lpn];
+    uint64_t time_diff = ssd->current_time - access->last_write_time;
+    
+    /* Reset count if more than 1 minute has passed */
+    if (time_diff > 60000000000ULL) {
+        access->write_count = 0;
+    }
+    
+    access->write_count++;
+    access->last_write_time = ssd->current_time;
 }
 
 static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
@@ -386,6 +439,9 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
+
+    /* initialize LBA access tracking for hot/cold data identification */
+    ssd_init_lba_access_tracking(ssd);
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -533,6 +589,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
     struct nand_page *pg = NULL;
     bool was_full_line = false;
     struct line *line;
+    int old_ipc;
 
     /* update corresponding page status */
     pg = get_pg(ssd, ppa);
@@ -553,22 +610,35 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
         ftl_assert(line->ipc == 0);
         was_full_line = true;
     }
+    old_ipc = line->ipc;
     line->ipc++;
     ftl_assert(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
-    /* Adjust the position of the victime line in the pq under over-writes */
-    if (line->pos) {
-        /* Note that line->vpc will be updated by this call */
-        pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-    } else {
-        line->vpc--;
-    }
+    line->vpc--;
 
     if (was_full_line) {
         /* move line: "full" -> "victim" */
         QTAILQ_REMOVE(&lm->full_line_list, line, entry);
         lm->full_line_cnt--;
-        pqueue_insert(lm->victim_line_pq, line);
+        /* Add to appropriate victim list based on line type */
+        if (line->type == 1) {
+            /* Hot data line */
+            QTAILQ_INSERT_TAIL(&lm->hot_victim_lists[line->ipc], line, entry);
+        } else {
+            /* Cold data line */
+            QTAILQ_INSERT_TAIL(&lm->cold_victim_lists[line->ipc], line, entry);
+        }
         lm->victim_line_cnt++;
+    } else {
+        /* Line is already in victim list, move to new position */
+        if (line->type == 1) {
+            /* Hot data line */
+            QTAILQ_REMOVE(&lm->hot_victim_lists[old_ipc], line, entry);
+            QTAILQ_INSERT_TAIL(&lm->hot_victim_lists[line->ipc], line, entry);
+        } else {
+            /* Cold data line */
+            QTAILQ_REMOVE(&lm->cold_victim_lists[old_ipc], line, entry);
+            QTAILQ_INSERT_TAIL(&lm->cold_victim_lists[line->ipc], line, entry);
+        }
     }
 }
 
@@ -668,23 +738,51 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 static struct line *select_victim_line(struct ssd *ssd, bool force)
 {
     struct line_mgmt *lm = &ssd->lm;
+    struct ssdparams *spp = &ssd->sp;
     struct line *victim_line = NULL;
 
-    victim_line = pqueue_peek(lm->victim_line_pq);
-    if (!victim_line) {
-        return NULL;
+    /* Priority: recycle hot data blocks with most invalid pages first */
+    for (int i = spp->pgs_per_line; i >= spp->pgs_per_line / 8; i--) {
+        /* Check hot data victim lists first */
+        victim_line = QTAILQ_FIRST(&lm->hot_victim_lists[i]);
+        if (victim_line) {
+            QTAILQ_REMOVE(&lm->hot_victim_lists[i], victim_line, entry);
+            lm->victim_line_cnt--;
+            return victim_line;
+        }
     }
 
-    if (!force && victim_line->ipc < ssd->sp.pgs_per_line / 8) {
-        return NULL;
+    /* If no hot data blocks meet the criteria, check cold data blocks */
+    for (int i = spp->pgs_per_line; i >= spp->pgs_per_line / 8; i--) {
+        victim_line = QTAILQ_FIRST(&lm->cold_victim_lists[i]);
+        if (victim_line) {
+            QTAILQ_REMOVE(&lm->cold_victim_lists[i], victim_line, entry);
+            lm->victim_line_cnt--;
+            return victim_line;
+        }
     }
 
-    pqueue_pop(lm->victim_line_pq);
-    victim_line->pos = 0;
-    lm->victim_line_cnt--;
+    /* If forced GC, recycle any available block */
+    if (force) {
+        for (int i = spp->pgs_per_line; i >= 0; i--) {
+            /* Check hot data victim lists first */
+            victim_line = QTAILQ_FIRST(&lm->hot_victim_lists[i]);
+            if (victim_line) {
+                QTAILQ_REMOVE(&lm->hot_victim_lists[i], victim_line, entry);
+                lm->victim_line_cnt--;
+                return victim_line;
+            }
+            /* Then check cold data victim lists */
+            victim_line = QTAILQ_FIRST(&lm->cold_victim_lists[i]);
+            if (victim_line) {
+                QTAILQ_REMOVE(&lm->cold_victim_lists[i], victim_line, entry);
+                lm->victim_line_cnt--;
+                return victim_line;
+            }
+        }
+    }
 
-    /* victim_line is a danggling node now */
-    return victim_line;
+    return NULL;
 }
 
 /* here ppa identifies the block we want to clean */
@@ -807,6 +905,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
+    struct line_mgmt *lm = &ssd->lm;
     int len = req->nlb;
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
@@ -819,6 +918,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
+    /* Update current time */
+    ssd->current_time = req->stime;
+
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
         r = do_gc(ssd, true);
@@ -827,11 +929,23 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        /* Update LBA access tracking */
+        update_lba_access(ssd, lpn);
+        
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
+        }
+
+        /* Determine if this is hot data and select appropriate write pointer */
+        if (is_hot_data(ssd, lpn)) {
+            /* Hot data: write to hot data line */
+            ssd->wp.curline = ssd->hot_curline;
+        } else {
+            /* Cold data: write to cold data line */
+            ssd->wp.curline = ssd->cold_curline;
         }
 
         /* new write */
